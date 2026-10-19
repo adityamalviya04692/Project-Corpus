@@ -25,7 +25,7 @@ const STEPS = [
 
 const METRICS = [
   { k: '100%', v: 'hit@1, hybrid retrieval', s: 'on the golden question set' },
-  { k: '1.00', v: 'mean reciprocal rank', s: 'vector-only scores 0.83' },
+  { k: '1.00', v: 'mean reciprocal rank', s: 'vector-only scores 0.82' },
   { k: '<50 ms', v: 'typical DuckDB query', s: 'in a Web Worker, on your machine' },
   { k: '0', v: 'servers holding your files', s: 'IndexedDB keeps your workspace' },
 ];

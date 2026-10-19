@@ -1,4 +1,5 @@
 import { useRef, useState } from 'react';
+import { AnimatePresence, motion } from 'motion/react';
 import { ACCEPT } from '../lib/parse';
 import type { Doc } from '../lib/types';
 
@@ -38,18 +39,25 @@ export default function Library({
         }}
       >
         <button className="btn" onClick={() => input.current?.click()} disabled={busy}>Add files</button>
-        <span>or drop PDF, DOCX, TXT, MD, CSV, HTML</span>
+        <span>or drop documents (PDF, DOCX, MD, HTML) and tables (CSV, Parquet, JSON)</span>
         <input ref={input} type="file" multiple accept={ACCEPT} hidden onChange={(e) => onFiles([...(e.target.files ?? [])])} />
       </div>
       {!docs.length && (
-        <button className="link sample" onClick={onSamples} disabled={busy}>Try with 3 sample documents →</button>
+        <button className="link sample" onClick={onSamples} disabled={busy}>Try with sample documents + a dataset →</button>
       )}
       {errors.map((e) => (
         <p key={e} className="warn">{e}</p>
       ))}
       <ul className="docs">
-        {docs.map((d) => (
-          <li key={d.id}>
+        <AnimatePresence initial={false}>
+        {docs.map((d, i) => (
+          <motion.li
+            key={d.id}
+            layout
+            initial={{ opacity: 0, x: -14, scale: 0.97 }}
+            animate={{ opacity: 1, x: 0, scale: 1, transition: { type: 'spring', stiffness: 420, damping: 32, delay: Math.min(i, 6) * 0.04 } }}
+            exit={{ opacity: 0, x: -20, height: 0, marginTop: 0, paddingTop: 0, paddingBottom: 0, transition: { duration: 0.22 } }}
+          >
             <span className={`kind kind-${d.kind}`}>{d.kind === 'markdown' ? 'md' : d.kind}</span>
             <div>
               <strong title={d.name}>{d.name}</strong>
@@ -59,8 +67,9 @@ export default function Library({
               <button className="icon-btn" onClick={() => onSummarize(d)} disabled={busy} title="Key insights" aria-label={`Key insights for ${d.name}`}>✦</button>
               <button className="icon-btn" onClick={() => onRemove(d.id)} disabled={busy} title="Remove" aria-label={`Remove ${d.name}`}>✕</button>
             </span>
-          </li>
+          </motion.li>
         ))}
+        </AnimatePresence>
       </ul>
       {docs.length > 0 && (
         <details className="chunking">

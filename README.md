@@ -1,8 +1,9 @@
-# Corpus — chat with your documents
+# Corpus — ask your documents, query your data
 
-Ask questions across PDFs, Word, Markdown, CSV and HTML files, get **cited answers**, get
-**insights per document**, and **compare documents side by side**. The whole retrieval
-pipeline runs in the browser and is shown live, stage by stage.
+Ask questions across PDFs, Word, Markdown and HTML files and get **cited answers**,
+**compare documents side by side**, and load **CSV, Parquet or JSON tables into DuckDB** to
+ask about them in plain English (questions become SQL). Everything runs in the browser, and
+the pipeline is shown live, stage by stage.
 
 **Live:** https://adityamalviya04692.github.io/Project-Corpus/ — landing page, then *Open app*.
 
@@ -13,6 +14,19 @@ pipeline runs in the browser and is shown live, stage by stage.
   or overlap and watch everything re-chunk and re-embed.
 - **Hybrid retrieval.** Cosine similarity on `all-MiniLM-L6-v2` embeddings (Transformers.js,
   in a Web Worker) blended with BM25 for exact terms like table names and error codes.
+- **Query understanding.** Questions are routed by intent: an *overview* ("what is this
+  document about?") samples the whole document and gets a narrative answer; a *comparison*
+  retrieves evidence per document; a *data* question becomes SQL; a named file scopes the
+  search. MMR re-ranking keeps passages from repeating each other.
+- **Data engineering in the browser.** Tabular files load into DuckDB-WASM and are profiled
+  on arrival (types, nulls, cardinality, IQR outliers, duplicates, unique-key candidates).
+  Auto charts (ECharts), an editable SQL console, natural language → SQL with a read-only
+  guard and one self-correcting retry, and a **dbt `schema.yml` data contract** inferred from
+  the profile.
+- **Measured retrieval.** A golden-question set scores keyword (BM25), vector and hybrid +
+  MMR retrieval on hit@1, hit@3 and MRR, live in the pipeline panel.
+- **Persistent workspace.** Documents, table files and every embedding are kept in
+  IndexedDB, so a refresh restores everything without re-parsing or re-embedding.
 - **Exact citations.** Chunks never span pages, every answer cites `[n]`, and each citation
   opens the source passage.
 - **Runs Google's Gemma 4 in the browser.** Gemma 4 E2B (2.8 GB, one-time download) runs on
@@ -48,6 +62,6 @@ Push to `main`: the GitHub Actions workflow tests, builds and publishes to GitHu
 
 ## Stack
 
-React 19 · TypeScript · Vite · Gemma 4 · WebLLM · Transformers.js · pdf.js · mammoth · marked + DOMPurify · Vitest · Cloudflare Workers (optional)
+React 19 · TypeScript · Vite · Motion · Gemma 4 · WebLLM · Transformers.js · DuckDB-WASM · ECharts · pdf.js · mammoth · marked + DOMPurify · Vitest · Cloudflare Workers (optional)
 
 MIT © Aditya Malviya

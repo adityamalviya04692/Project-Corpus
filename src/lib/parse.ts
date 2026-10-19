@@ -5,10 +5,10 @@ import type { Doc, Page } from './types';
 
 const EXT: Record<string, Doc['kind']> = {
   pdf: 'pdf', docx: 'docx', txt: 'text', md: 'markdown', markdown: 'markdown',
-  csv: 'csv', tsv: 'csv', html: 'html', htm: 'html', json: 'text', log: 'text',
+  csv: 'csv', tsv: 'csv', html: 'html', htm: 'html', json: 'text', log: 'text', jsonl: 'text', ndjson: 'text', parquet: 'csv', pq: 'csv',
 };
 
-export const ACCEPT = '.pdf,.docx,.txt,.md,.markdown,.csv,.tsv,.html,.htm,.json,.log';
+export const ACCEPT = '.pdf,.docx,.txt,.md,.markdown,.csv,.tsv,.parquet,.jsonl,.ndjson,.html,.htm,.json,.log';
 
 export function kindOf(name: string): Doc['kind'] | null {
   return EXT[name.split('.').pop()?.toLowerCase() ?? ''] ?? null;

@@ -1,16 +1,20 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { AnimatePresence, MotionConfig, motion, type Transition } from 'motion/react';
 import Library from './components/Library';
+import Logo from './components/Logo';
 import Markdown from './components/Markdown';
 import Pipeline from './components/Pipeline';
+import DataView, { ResultView, type SqlAnswer } from './components/DataView';
 import EngineDialog from './components/Settings';
 import { chunkDoc } from './lib/chunk';
 import { EMBED_DIMS, EMBED_MODEL, embed } from './lib/embedder';
 import { compressHits, extractive, extractiveOverview, rankSentences } from './lib/instant';
 import { docKind, plan, type Intent } from './lib/intent';
 import { citationOccurrences, citedNumbers, supportFor } from './lib/support';
-import { parseFile } from './lib/parse';
+import { ACCEPT, parseFile } from './lib/parse';
 import { evaluate, type EvalRow } from './lib/eval';
 import { fileHash, kvGet, kvSet } from './lib/store';
+import { TABULAR, describeResult, explainMessages, extractSql, heuristicSql, loadTable, pickTable, query as runSql, safeSql, sqlMessages, tableAsText, wantsData, type Result, type Table } from './lib/data';
 import { answerMessages, compareMessages, ensureCitations, overviewMessages, summaryMessages } from './lib/prompts';
 import { BROWSER_MODELS, DEMO_URL, PROVIDERS, browserModelLoaded, generate, loadBrowserModel, modelFor, type ProviderId, type Settings } from './lib/providers';
 import { Index } from './lib/search';
@@ -34,11 +38,19 @@ type Msg = {
   quoted?: boolean;
   /** How the question was understood (shown as a small label). */
   intent?: Intent;
+  /** Data answers: the SQL that ran and its result. */
+  sql?: string;
+  result?: Result;
 };
+
+// iMessage-like: bubbles rise from below with a soft overshoot; the thread glides up.
+const BUBBLE: Transition = { type: 'spring', stiffness: 460, damping: 32, mass: 0.8 };
+const PANEL: Transition = { type: 'spring', stiffness: 360, damping: 34 };
 
 const INTENT_LABEL: Record<Intent, string> = { overview: 'Overview', compare: 'Comparison', list: 'List', lookup: 'Answer', data: 'Data' };
 
-const SAMPLES = ['lakehouse-design-v1.md', 'lakehouse-design-v2.md', 'incident-postmortem-2026-03.md'];
+const SAMPLES = ['lakehouse-design-v1.md', 'lakehouse-design-v2.md', 'incident-postmortem-2026-03.md', 'pipeline-runs.csv'];
+const EVAL_DOCS = SAMPLES.slice(0, 3);
 const SETTINGS_KEY = 'corpus-settings';
 // With a hosted proxy configured, new visitors get real answers straight away.
 const DEFAULT_SETTINGS: Settings = { provider: DEMO_URL ? 'demo' : 'instant', keys: {}, models: {}, baseUrl: '' };
@@ -71,7 +83,11 @@ export default function App({ autoSamples = false }: { autoSamples?: boolean }) 
   const [showSettings, setShowSettings] = useState(false);
   const [inspector, setInspector] = useState(() => window.innerWidth > 1180);
   const [engineLoad, setEngineLoad] = useState<{ p: number; text: string; error?: string } | null>(null);
-  const [tab, setTab] = useState<'ask' | 'compare'>('ask');
+  const [tab, setTab] = useState<'ask' | 'compare' | 'data'>('ask');
+  const [tables, setTables] = useState<Table[]>([]);
+  const tablesRef = useRef<Table[]>([]);
+  tablesRef.current = tables;
+  const tableFiles = useRef(new Map<string, File>());
   const [messages, setMessages] = useState<Msg[]>([]);
   const [compareResult, setCompareResult] = useState<Msg | null>(null);
   const [source, setSource] = useState<{ n: number; hit: Hit; support?: string } | null>(null);
@@ -155,7 +171,8 @@ export default function App({ autoSamples = false }: { autoSamples?: boolean }) 
           continue;
         }
         seen.add(hash);
-        parsed.push({ ...(await parseFile(f)), hash });
+        if (TABULAR.test(f.name)) parsed.push({ ...(await addTable(f)), hash });
+        else parsed.push({ ...(await parseFile(f)), hash });
       } catch (e) {
         errs.push(e instanceof Error ? e.message : String(e));
       }
@@ -166,6 +183,20 @@ export default function App({ autoSamples = false }: { autoSamples?: boolean }) 
     setDocs(next);
     setBusy(false);
     await rebuild(next);
+  }
+
+  /* Tabular files become DuckDB tables; the document indexed for chat is the table's
+     profile in words (what each column holds, ranges, quality), not thousands of raw rows. */
+  async function addTable(f: File): Promise<Doc> {
+    const t0 = performance.now();
+    const t = await loadTable(f, tablesRef.current.map((x) => x.name));
+    const next = [...tablesRef.current.filter((x) => x.file !== f.name), t];
+    tablesRef.current = next;
+    setTables(next);
+    tableFiles.current.set(f.name, f);
+    void kvSet('tables', [...tableFiles.current.values()]);
+    const text = tableAsText(t);
+    return { id: `${f.name}-${f.size}-${Math.random().toString(36).slice(2, 7)}`, name: f.name, kind: 'csv', bytes: f.size, pages: [{ page: 1, text }], chars: text.length, parseMs: performance.now() - t0 };
   }
 
   // Restore the last workspace (documents + chunking) from IndexedDB; embeddings come
@@ -181,13 +212,34 @@ export default function App({ autoSamples = false }: { autoSamples?: boolean }) 
         await rebuild(saved.docs, saved.chunking);
       }
       setRestored(true);
+      // Tables come back from their saved files (DuckDB itself lives in memory).
+      const files = (await kvGet<File[]>('tables')) ?? [];
+      for (const f of files.filter((x) => saved?.docs?.some((d) => d.name === x.name))) {
+        try {
+          const t = await loadTable(f, tablesRef.current.map((x) => x.name));
+          tableFiles.current.set(f.name, f);
+          tablesRef.current = [...tablesRef.current, t];
+          setTables(tablesRef.current);
+        } catch {
+          /* unreadable file: the document stays, without its table */
+        }
+      }
     })();
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     if (restored) void kvSet('workspace', { docs, chunking });
   }, [docs, chunking, restored]);
 
+  function dropTables(keep: (file: string) => boolean) {
+    for (const name of [...tableFiles.current.keys()]) if (!keep(name)) tableFiles.current.delete(name);
+    void kvSet('tables', [...tableFiles.current.values()]);
+    tablesRef.current = tablesRef.current.filter((t) => keep(t.file));
+    setTables(tablesRef.current);
+  }
+
   function clearWorkspace() {
+    dropTables(() => false);
+    setTab('ask');
     docsRef.current = [];
     setDocs([]);
     setMessages([]);
@@ -198,7 +250,7 @@ export default function App({ autoSamples = false }: { autoSamples?: boolean }) 
 
   /* Retrieval evaluation (sample documents only): keyword vs vector vs hybrid. */
   const [evalRows, setEvalRows] = useState<EvalRow[] | null>(null);
-  const canEvaluate = embedReady && SAMPLES.every((n) => docs.some((d) => d.name === n));
+  const canEvaluate = embedReady && EVAL_DOCS.every((n) => docs.some((d) => d.name === n));
   async function runEvaluation() {
     setEvalRows(await evaluate(index.current, (id) => docMap.get(id)?.name ?? '', embed));
   }
@@ -238,13 +290,15 @@ export default function App({ autoSamples = false }: { autoSamples?: boolean }) 
   async function addSamples() {
     const base = import.meta.env.BASE_URL;
     const files = await Promise.all(
-      SAMPLES.map(async (name) => new File([await (await fetch(`${base}samples/${name}`)).text()], name, { type: 'text/markdown' })),
+      SAMPLES.map(async (name) => new File([await (await fetch(`${base}samples/${name}`)).text()], name, { type: name.endsWith('.csv') ? 'text/csv' : 'text/markdown' })),
     );
     await addFiles(files);
   }
 
   function removeDoc(id: string) {
     const next = docsRef.current.filter((d) => d.id !== id);
+    dropTables((file) => next.some((d) => d.name === file));
+    if (tab === 'data' && !tablesRef.current.length) setTab('ask');
     docsRef.current = next;
     setDocs(next);
     void rebuild(next);
@@ -317,6 +371,52 @@ export default function App({ autoSamples = false }: { autoSamples?: boolean }) 
 
   const updateMsg = (m: Msg) => setMessages((list) => list.map((x) => (x.id === m.id ? m : x)));
 
+  /* Natural language → SQL. A model writes it (one self-correcting retry with the
+     DuckDB error); without a model, a rule-based translator covers common questions.
+     Every query passes a read-only guard before it runs. */
+  async function askSql(question: string, t: Table): Promise<SqlAnswer> {
+    const useModel = !quotesOnly;
+    let sql = '';
+    let error: { sql: string; message: string } | undefined;
+    for (let attempt = 1; attempt <= (useModel ? 2 : 1); attempt++) {
+      try {
+        sql = useModel ? extractSql(await generate(settings, sqlMessages(question, t, error), () => {})) : heuristicSql(question, t) ?? '';
+        if (!sql) return { sql: '', error: 'Instant mode understands questions like “average duration by pipeline” or “failed runs over time”. Load Gemma or add a key for anything else.', attempts: 0 };
+        sql = safeSql(sql);
+        return { sql, result: await runSql(sql), attempts: useModel ? attempt : 0 };
+      } catch (e) {
+        error = { sql, message: e instanceof Error ? e.message : String(e) };
+      }
+    }
+    return { sql, error: error?.message ?? 'Query failed', attempts: 2 };
+  }
+
+  /** Chat questions about tables: SQL, a chart-ready result, and a plain-words reading. */
+  async function answerData(query: string, slot: Msg): Promise<boolean> {
+    const t = pickTable(query, tablesRef.current);
+    const ready: Msg = { ...slot, intent: 'data', phase: quotesOnly ? `Translating to SQL over ${t.name}` : `Writing SQL with ${engineName}` };
+    updateMsg(ready);
+    const a = await askSql(query, t);
+    if (!a.sql) return false; // not a question the rules understand: answer from the text instead
+    if (!a.result) {
+      updateMsg({ ...ready, status: 'error', sql: a.sql, text: `**The query failed:** ${a.error}`, meta: secs(ready) });
+      return true;
+    }
+    const base: Msg = { ...ready, sql: a.sql, result: a.result, text: describeResult(a.result), quoted: false };
+    if (quotesOnly || !a.result.rows.length) {
+      updateMsg({ ...base, status: 'done', meta: `DuckDB · ${a.result.ms.toFixed(0)} ms · ${secs(ready)}` });
+      return true;
+    }
+    updateMsg({ ...base, phase: 'Reading the result' });
+    try {
+      const text = await generate(settings, explainMessages(query, a.sql, a.result), (tk) => updateMsg({ ...base, text: tk, status: 'streaming' }));
+      updateMsg({ ...base, text: text || base.text, status: 'done', meta: `${engineName} + DuckDB · ${secs(ready)}` });
+    } catch {
+      updateMsg({ ...base, status: 'done', meta: `DuckDB · ${secs(ready)}` });
+    }
+    return true;
+  }
+
   async function ask(q: string) {
     const query = q.trim();
     if (!query || answering || !chunks.length) return;
@@ -330,11 +430,13 @@ export default function App({ autoSamples = false }: { autoSamples?: boolean }) 
     const slot: Msg = { id: ++msgId, role: 'assistant', text: '', status: 'working', started: performance.now(), phase: 'Finding relevant passages' };
     setMessages((list) => [...list, user, slot]);
     const compact = settings.provider === 'browser';
-    const route = plan(query, docs);
+    const route = plan(query, docs, tablesRef.current.length > 0, wantsData(query, tablesRef.current));
     const scoped = route.docIds.length ? new Set(route.docIds) : undefined;
     const fallbackEmbed = embedReady ? embed : undefined;
 
-    if (route.intent === 'overview') {
+    if (route.intent === 'data' && (await answerData(query, slot))) {
+      // answered with SQL
+    } else if (route.intent === 'overview') {
       // An even sample across each target document, then a narrative answer.
       const targets = (route.docIds.length ? docs.filter((d) => scoped!.has(d.id)) : docs).slice(0, 4);
       const per = targets.length === 1 ? (compact ? 6 : 8) : compact ? 3 : 4;
@@ -443,6 +545,14 @@ export default function App({ autoSamples = false }: { autoSamples?: boolean }) 
     });
   };
 
+  // Keep the newest message in view while answers stream in (unless the reader scrolled up).
+  const threadRef = useRef<HTMLDivElement>(null);
+  const pinned = useRef(true);
+  useLayoutEffect(() => {
+    const el = threadRef.current;
+    if (el && pinned.current) el.scrollTo({ top: el.scrollHeight, behavior: messages.length > 2 ? 'smooth' : 'auto' });
+  }, [messages]);
+
   const chunkCount = (id: string) => chunks.filter((c) => c.docId === id).length;
   const browserReady = browserModelLoaded(modelFor(settings, 'browser'));
   const engineName = settings.provider === 'browser' ? browserLabel : provider.label;
@@ -456,7 +566,7 @@ export default function App({ autoSamples = false }: { autoSamples?: boolean }) 
           : '';
   const quotesOnly = settings.provider === 'instant' || (settings.provider === 'browser' && !browserReady);
   const suggestions = docs.some((d) => d.name.startsWith('lakehouse-design'))
-    ? ['What changed between the v1 and v2 lakehouse designs?', 'How was the skewed join incident fixed?', 'What is the data freshness SLA now?']
+    ? ['What changed between the v1 and v2 lakehouse designs?', 'What is the incident post-mortem about?', tables.length ? 'Average duration_min by pipeline' : 'What is the data freshness SLA now?']
     : ['Summarise what these documents are about', 'What are the key risks or open issues?', 'List every number or deadline mentioned'];
 
 
@@ -486,10 +596,11 @@ export default function App({ autoSamples = false }: { autoSamples?: boolean }) 
   );
 
   return (
+    <MotionConfig reducedMotion="user">
     <div className="shell">
       <header className="appbar">
         <a className="brand-sm" href="#/" aria-label="Corpus home">
-          <span className="logo" aria-hidden="true" />
+          <Logo />
           Corpus
         </a>
         <span className="appbar-stat">
@@ -527,33 +638,52 @@ export default function App({ autoSamples = false }: { autoSamples?: boolean }) 
 
         <main className="stage">
           <div className="segmented" role="tablist">
-            <button role="tab" aria-selected={tab === 'ask'} onClick={() => setTab('ask')}>Ask</button>
-            <button role="tab" aria-selected={tab === 'compare'} onClick={() => setTab('compare')} disabled={docs.length < 2} title={docs.length < 2 ? 'Add at least two documents' : ''}>Compare</button>
+            <button role="tab" aria-selected={tab === 'ask'} onClick={() => setTab('ask')}>{tab === 'ask' && <Pill />}Ask</button>
+            <button role="tab" aria-selected={tab === 'compare'} onClick={() => setTab('compare')} disabled={docs.length < 2} title={docs.length < 2 ? 'Add at least two documents' : ''}>{tab === 'compare' && <Pill />}Compare</button>
+            <button role="tab" aria-selected={tab === 'data'} onClick={() => setTab('data')} disabled={!tables.length} title={tables.length ? '' : 'Add a CSV, Parquet or JSON file'}>{tab === 'data' && <Pill />}Data{tables.length ? <em>{tables.length}</em> : null}</button>
           </div>
 
-          {tab === 'ask' ? (
-            <section className="chat" aria-label="Ask your documents">
-              <div className="thread" aria-live="polite">
+          <AnimatePresence mode="wait" initial={false}>
+          {tab === 'data' && tables.length ? (
+            <motion.div key="data" className="view" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -6 }} transition={{ duration: 0.22, ease: [0.22, 1, 0.36, 1] }}>
+              <DataView tables={tables} askSql={askSql} canAsk={!quotesOnly} engineName={engineName} />
+            </motion.div>
+          ) : tab === 'ask' || tab === 'data' ? (
+            <motion.section key="ask" className="chat" aria-label="Ask your documents" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -6 }} transition={{ duration: 0.22, ease: [0.22, 1, 0.36, 1] }}>
+              <div
+                className="thread"
+                aria-live="polite"
+                ref={threadRef}
+                onScroll={(e) => {
+                  const el = e.currentTarget;
+                  pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+                }}
+              >
                 {!messages.length &&
                   (docs.length ? (
-                    <div className="welcome">
+                    <motion.div className="welcome" initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={PANEL}>
                       <h2>What would you like to know?</h2>
                       <p>Ask across {docs.length === 1 ? 'your document' : `all ${docs.length} documents`}. Every answer cites its sources.</p>
                       <div className="chips">
-                        {suggestions.map((s) => (
-                          <button key={s} onClick={() => ask(s)} disabled={answering || !chunks.length}>{s}</button>
+                        {suggestions.map((s, i) => (
+                          <motion.button key={s} onClick={() => ask(s)} disabled={answering || !chunks.length} initial={{ opacity: 0, y: 12, scale: 0.96 }} animate={{ opacity: 1, y: 0, scale: 1 }} transition={{ ...BUBBLE, delay: 0.12 + i * 0.06 }} whileHover={{ y: -2 }} whileTap={{ scale: 0.97 }}>
+                            {s}
+                          </motion.button>
                         ))}
                       </div>
-                    </div>
+                    </motion.div>
                   ) : (
                     <EmptyDrop busy={busy} onFiles={addFiles} onSamples={addSamples} />
                   ))}
+                <AnimatePresence initial={false}>
                 {messages.map((m) =>
                   m.role === 'user' ? (
-                    <div key={m.id} className="msg user">{m.text}</div>
+                    <motion.div key={m.id} className="msg user" layout="position" initial={{ opacity: 0, y: 28, scale: 0.86 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, scale: 0.9 }} transition={BUBBLE}>
+                      {m.text}
+                    </motion.div>
                   ) : (
-                    <article key={m.id} className={`msg bot ${m.status}`}>
-                      <span className="bot-mark" aria-hidden="true" />
+                    <motion.article key={m.id} className={`msg bot ${m.status}`} layout="position" initial={{ opacity: 0, y: 18 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} transition={{ ...BUBBLE, delay: 0.08 }}>
+                      <span className="bot-mark" aria-hidden="true"><Logo /></span>
                       <div className="bot-body">
                         {(m.quoted || m.intent) && (
                           <div className="msg-tags">
@@ -562,12 +692,20 @@ export default function App({ autoSamples = false }: { autoSamples?: boolean }) 
                           </div>
                         )}
                         {m.status === 'working' && !m.text ? <Working phase={m.phase} started={m.started} /> : <Markdown text={m.text} onCite={openSource(m)} tips={tipsFor(m)} />}
-                        {m.status !== 'working' && <Sources m={m} onOpen={openSource(m)} label={sourceLabel} docOf={(h) => docMap.get(h.chunk.docId)?.name ?? ''} />}
+                        {m.sql && (
+                          <details className="sql-peek">
+                            <summary>SQL</summary>
+                            <pre>{m.sql}</pre>
+                          </details>
+                        )}
+                        {m.result && <ResultView r={m.result} compact />}
+                        {m.status !== 'working' && !m.sql && <Sources m={m} onOpen={openSource(m)} label={sourceLabel} docOf={(h) => docMap.get(h.chunk.docId)?.name ?? ''} />}
                         {m.meta && <small className="meta">{m.meta}</small>}
                       </div>
-                    </article>
+                    </motion.article>
                   ),
                 )}
+                </AnimatePresence>
               </div>
               {docs.length > 0 && engineBanner}
               <form
@@ -594,12 +732,12 @@ export default function App({ autoSamples = false }: { autoSamples?: boolean }) 
                 {answering ? (
                   <button type="button" className="send stop" onClick={() => abort.current?.abort()} aria-label="Stop">■</button>
                 ) : (
-                  <button className="send" disabled={!question.trim() || !chunks.length} aria-label="Ask">↑</button>
+                  <motion.button className="send" disabled={!question.trim() || !chunks.length} aria-label="Ask" whileTap={{ scale: 0.86 }} animate={{ scale: question.trim() ? 1 : 0.94 }} transition={BUBBLE}>↑</motion.button>
                 )}
               </form>
-            </section>
+            </motion.section>
           ) : (
-            <section className="compare" aria-label="Compare documents">
+            <motion.section key="compare" className="compare" aria-label="Compare documents" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -6 }} transition={{ duration: 0.22, ease: [0.22, 1, 0.36, 1] }}>
               <div className="compare-head">
                 <h2>Compare documents</h2>
                 <p>Choose two or more and what to compare. Corpus retrieves the strongest passages from each and lines them up.</p>
@@ -633,17 +771,18 @@ export default function App({ autoSamples = false }: { autoSamples?: boolean }) 
               </form>
               {engineBanner}
               {compareResult && (
-                <article className={`msg bot wide ${compareResult.status}`}>
-                  <span className="bot-mark" aria-hidden="true" />
+                <motion.article key={compareResult.id} className={`msg bot wide ${compareResult.status}`} initial={{ opacity: 0, y: 18 }} animate={{ opacity: 1, y: 0 }} transition={BUBBLE}>
+                  <span className="bot-mark" aria-hidden="true"><Logo /></span>
                   <div className="bot-body">
                     {compareResult.quoted && <span className="quote-label">Quoted from your documents</span>}
                     {compareResult.status === 'working' && !compareResult.text ? <Working phase={compareResult.phase} started={compareResult.started} /> : <Markdown text={compareResult.text} onCite={openSource(compareResult)} tips={tipsFor(compareResult)} />}
                     {compareResult.meta && <small className="meta">{compareResult.meta}</small>}
                   </div>
-                </article>
+                </motion.article>
               )}
-            </section>
+            </motion.section>
           )}
+          </AnimatePresence>
         </main>
 
         {inspector && (
@@ -653,9 +792,10 @@ export default function App({ autoSamples = false }: { autoSamples?: boolean }) 
         )}
       </div>
 
+      <AnimatePresence>
       {source && (
-        <div className="drawer-backdrop" onClick={() => setSource(null)}>
-          <aside className="drawer" onClick={(e) => e.stopPropagation()} aria-label="Source passage">
+        <motion.div key="drawer" className="drawer-backdrop" onClick={() => setSource(null)} initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: 0.2 }}>
+          <motion.aside className="drawer" onClick={(e) => e.stopPropagation()} aria-label="Source passage" initial={{ x: '100%' }} animate={{ x: 0 }} exit={{ x: '100%' }} transition={PANEL}>
             <header>
               <span className="cite big">{source.n}</span>
               <div>
@@ -670,9 +810,10 @@ export default function App({ autoSamples = false }: { autoSamples?: boolean }) 
             <div className="passage">
               <Markdown text={source.hit.chunk.text} highlight={source.support} />
             </div>
-          </aside>
-        </div>
+          </motion.aside>
+        </motion.div>
       )}
+      </AnimatePresence>
 
       <EngineDialog
         open={showSettings}
@@ -683,7 +824,13 @@ export default function App({ autoSamples = false }: { autoSamples?: boolean }) 
         onLoadBrowser={loadBrowser}
       />
     </div>
+    </MotionConfig>
   );
+}
+
+/* The sliding selection behind the active tab (shared layout animation). */
+function Pill() {
+  return <motion.span layoutId="seg-pill" className="seg-pill" transition={{ type: 'spring', stiffness: 500, damping: 38 }} />;
 }
 
 /* Live progress for a pending answer: the current pipeline step and elapsed time. */
@@ -696,7 +843,7 @@ function Working({ phase, started }: { phase?: string; started?: number }) {
   const s = started ? (performance.now() - started) / 1000 : 0;
   return (
     <span className="working">
-      <i className="spinner" aria-hidden="true" />
+      <span className="typing-dots" aria-hidden="true"><i /><i /><i /></span>
       {phase ?? 'Working'}
       <b>{s.toFixed(1)} s</b>
     </span>
@@ -747,13 +894,13 @@ function EmptyDrop({ busy, onFiles, onSamples }: { busy: boolean; onFiles: (f: F
     >
       <span className="drop-icon" aria-hidden="true">⇪</span>
       <h2>Drop your documents here</h2>
-      <p>PDF, Word, Markdown, CSV, HTML or text. Everything is processed on your device.</p>
+      <p>PDF, Word, Markdown, HTML or text — and CSV, Parquet or JSON tables you can query with SQL. Everything stays on your device.</p>
       <div className="hero-cta">
         <label className="btn">
           Choose files
-          <input type="file" multiple hidden accept=".pdf,.docx,.txt,.md,.markdown,.csv,.tsv,.html,.htm,.json,.log" onChange={(e) => onFiles([...(e.target.files ?? [])])} />
+          <input type="file" multiple hidden accept={ACCEPT} onChange={(e) => onFiles([...(e.target.files ?? [])])} />
         </label>
-        <button className="btn ghost" onClick={onSamples} disabled={busy}>Try 3 sample documents</button>
+        <button className="btn ghost" onClick={onSamples} disabled={busy}>Try the samples</button>
       </div>
     </div>
   );

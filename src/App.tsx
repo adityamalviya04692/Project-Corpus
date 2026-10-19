@@ -5,10 +5,13 @@ import Pipeline from './components/Pipeline';
 import EngineDialog from './components/Settings';
 import { chunkDoc } from './lib/chunk';
 import { EMBED_DIMS, EMBED_MODEL, embed } from './lib/embedder';
-import { compressHits, extractive, rankSentences } from './lib/instant';
+import { compressHits, extractive, extractiveOverview, rankSentences } from './lib/instant';
+import { docKind, plan, type Intent } from './lib/intent';
 import { citationOccurrences, citedNumbers, supportFor } from './lib/support';
 import { parseFile } from './lib/parse';
-import { answerMessages, compareMessages, ensureCitations, summaryMessages } from './lib/prompts';
+import { evaluate, type EvalRow } from './lib/eval';
+import { fileHash, kvGet, kvSet } from './lib/store';
+import { answerMessages, compareMessages, ensureCitations, overviewMessages, summaryMessages } from './lib/prompts';
 import { BROWSER_MODELS, DEMO_URL, PROVIDERS, browserModelLoaded, generate, loadBrowserModel, modelFor, type ProviderId, type Settings } from './lib/providers';
 import { Index } from './lib/search';
 import type { ChatMessage, Chunk, Doc, Hit, PipelineStats } from './lib/types';
@@ -29,7 +32,11 @@ type Msg = {
   started?: number;
   /** True for Instant-mode answers, which quote documents rather than write. */
   quoted?: boolean;
+  /** How the question was understood (shown as a small label). */
+  intent?: Intent;
 };
+
+const INTENT_LABEL: Record<Intent, string> = { overview: 'Overview', compare: 'Comparison', list: 'List', lookup: 'Answer', data: 'Data' };
 
 const SAMPLES = ['lakehouse-design-v1.md', 'lakehouse-design-v2.md', 'incident-postmortem-2026-03.md'];
 const SETTINGS_KEY = 'corpus-settings';
@@ -128,24 +135,72 @@ export default function App({ autoSamples = false }: { autoSamples?: boolean }) 
     }
   }
 
+  // Latest documents, for async flows that outlive a render (restore, uploads).
+  const docsRef = useRef<Doc[]>([]);
+  docsRef.current = docs;
+
   async function addFiles(files: File[]) {
     if (!files.length) return;
     setBusy(true);
     setErrors([]);
     const parsed: Doc[] = [];
     const errs: string[] = [];
+    const seen = new Set(docsRef.current.map((d) => d.hash).filter(Boolean));
     for (const f of files) {
       try {
-        parsed.push(await parseFile(f));
+        if (f.size > 60 * 1024 * 1024) throw new Error(`${f.name}: larger than 60 MB`);
+        const hash = await fileHash(f);
+        if (seen.has(hash)) {
+          errs.push(`${f.name}: already added (same content), skipped`);
+          continue;
+        }
+        seen.add(hash);
+        parsed.push({ ...(await parseFile(f)), hash });
       } catch (e) {
         errs.push(e instanceof Error ? e.message : String(e));
       }
     }
     setErrors(errs);
-    const next = [...docs, ...parsed];
+    const next = [...docsRef.current, ...parsed];
+    docsRef.current = next;
     setDocs(next);
     setBusy(false);
     await rebuild(next);
+  }
+
+  // Restore the last workspace (documents + chunking) from IndexedDB; embeddings come
+  // back from the vector cache, so nothing is recomputed. Then save on every change.
+  const [restored, setRestored] = useState(false);
+  useEffect(() => {
+    void (async () => {
+      const saved = await kvGet<{ docs: Doc[]; chunking: { size: number; overlap: number } }>('workspace');
+      if (saved?.docs?.length) {
+        setChunking(saved.chunking);
+        docsRef.current = saved.docs;
+        setDocs(saved.docs);
+        await rebuild(saved.docs, saved.chunking);
+      }
+      setRestored(true);
+    })();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (restored) void kvSet('workspace', { docs, chunking });
+  }, [docs, chunking, restored]);
+
+  function clearWorkspace() {
+    docsRef.current = [];
+    setDocs([]);
+    setMessages([]);
+    setCompareResult(null);
+    setEvalRows(null);
+    void rebuild([]);
+  }
+
+  /* Retrieval evaluation (sample documents only): keyword vs vector vs hybrid. */
+  const [evalRows, setEvalRows] = useState<EvalRow[] | null>(null);
+  const canEvaluate = embedReady && SAMPLES.every((n) => docs.some((d) => d.name === n));
+  async function runEvaluation() {
+    setEvalRows(await evaluate(index.current, (id) => docMap.get(id)?.name ?? '', embed));
   }
 
   // Start downloading the embedding model the moment the workspace opens, so it is
@@ -157,11 +212,11 @@ export default function App({ autoSamples = false }: { autoSamples?: boolean }) 
   // "Try with samples" from the landing page loads them straight away.
   const autoLoaded = useRef(false);
   useEffect(() => {
-    if (autoSamples && !autoLoaded.current) {
+    if (autoSamples && restored && !autoLoaded.current) {
       autoLoaded.current = true;
-      void addSamples();
+      if (!SAMPLES.every((n) => docsRef.current.some((d) => d.name === n))) void addSamples();
     }
-  }, [autoSamples]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [autoSamples, restored]); // eslint-disable-line react-hooks/exhaustive-deps
 
   /* One-time download of the in-browser model, with progress shown in the app bar. */
   async function loadBrowser(id = modelFor(settings, 'browser')) {
@@ -189,7 +244,8 @@ export default function App({ autoSamples = false }: { autoSamples?: boolean }) 
   }
 
   function removeDoc(id: string) {
-    const next = docs.filter((d) => d.id !== id);
+    const next = docsRef.current.filter((d) => d.id !== id);
+    docsRef.current = next;
     setDocs(next);
     void rebuild(next);
   }
@@ -201,7 +257,7 @@ export default function App({ autoSamples = false }: { autoSamples?: boolean }) 
   }
 
   /* Retrieval shared by every mode. */
-  async function retrieve(query: string, k: number, only?: Set<string>): Promise<Hit[]> {
+  async function retrieve(query: string, k: number, only?: Set<string>, strategy = 'hybrid + MMR'): Promise<Hit[]> {
     const t0 = performance.now();
     let qvec: Float32Array | null = null;
     if (embedReady) {
@@ -216,6 +272,7 @@ export default function App({ autoSamples = false }: { autoSamples?: boolean }) 
       ...s,
       retrieve: {
         query,
+        strategy,
         ms: performance.now() - t0,
         k,
         hits: hits.map((h) => ({ label: `${docMap.get(h.chunk.docId)?.name ?? ''} · #${h.chunk.index + 1}`, score: h.score, vector: h.vector, keyword: h.keyword })),
@@ -272,13 +329,49 @@ export default function App({ autoSamples = false }: { autoSamples?: boolean }) 
     const user: Msg = { id: ++msgId, role: 'user', text: query };
     const slot: Msg = { id: ++msgId, role: 'assistant', text: '', status: 'working', started: performance.now(), phase: 'Finding relevant passages' };
     setMessages((list) => [...list, user, slot]);
-    const hits = await retrieve(query, 6);
-    const ready = { ...slot, hits };
-    updateMsg(ready);
-    // On-device models get a compressed context: the best few sentences of each passage.
     const compact = settings.provider === 'browser';
-    const context = compact ? await compressHits(query, hits.slice(0, 5), embedReady ? embed : undefined) : hits;
-    await respond(ready, updateMsg, answerMessages(query, context, docMap, history, compact), () => extractive(query, hits, embedReady ? embed : undefined));
+    const route = plan(query, docs);
+    const scoped = route.docIds.length ? new Set(route.docIds) : undefined;
+    const fallbackEmbed = embedReady ? embed : undefined;
+
+    if (route.intent === 'overview') {
+      // An even sample across each target document, then a narrative answer.
+      const targets = (route.docIds.length ? docs.filter((d) => scoped!.has(d.id)) : docs).slice(0, 4);
+      const per = targets.length === 1 ? (compact ? 6 : 8) : compact ? 3 : 4;
+      const chosen = targets.map((d) => {
+        const title = d.pages[0]?.text.split('\n').find((l) => l.trim())?.replace(/^#+\s*/, '').slice(0, 90) ?? '';
+        return { doc: d, title, kind: docKind(title, d.kind), chunks: index.current.spread(d.id, per) };
+      });
+      const hits: Hit[] = chosen.flatMap((c) => c.chunks.map((chunk) => ({ chunk, score: 1, vector: 0, keyword: 0 })));
+      setStats((st) => ({ ...st, retrieve: { query, strategy: `even sample · ${targets.length} doc${targets.length > 1 ? 's' : ''}`, ms: 0, k: hits.length, hits: hits.map((h) => ({ label: `${docMap.get(h.chunk.docId)?.name ?? ''} · #${h.chunk.index + 1}`, score: 1, vector: 0, keyword: 0 })) } }));
+      const ready = { ...slot, hits, intent: route.intent };
+      updateMsg(ready);
+      let n = 0;
+      const fallback = () =>
+        extractiveOverview(
+          chosen.map((c) => ({ name: c.doc.name, kind: c.kind, title: c.title, hits: c.chunks.map((chunk) => ({ hit: { chunk, score: 1, vector: 0, keyword: 0 }, n: ++n })) })),
+          fallbackEmbed,
+        );
+      const context = compact ? await compressHits(query + ' main purpose, decisions, numbers, conclusions', hits, fallbackEmbed, 2) : hits;
+      await respond(ready, updateMsg, overviewMessages(chosen.map((c) => ({ doc: c.doc, kind: c.kind })), context, docMap, query, compact), fallback);
+    } else if (route.intent === 'compare') {
+      // Evidence from each side, so neither document crowds out the other.
+      const sides = (route.docIds.length >= 2 ? docs.filter((d) => scoped!.has(d.id)) : docs).slice(0, 3);
+      const hits: Hit[] = [];
+      for (const d of sides) hits.push(...(await retrieve(query, compact ? 2 : 3, new Set([d.id]), `per-document · ${sides.length} docs`)));
+      const ready = { ...slot, hits, intent: route.intent };
+      updateMsg(ready);
+      const context = compact ? await compressHits(query, hits, fallbackEmbed, 3) : hits;
+      await respond(ready, updateMsg, compareMessages(query, context, docMap, sides), () => extractive(query, hits, fallbackEmbed));
+    } else {
+      const k = route.intent === 'list' ? 8 : 6;
+      const hits = await retrieve(query, k, scoped, scoped ? `scoped to ${route.docIds.length} doc${route.docIds.length > 1 ? 's' : ''} · MMR` : 'hybrid + MMR');
+      const ready = { ...slot, hits, intent: route.intent };
+      updateMsg(ready);
+      // On-device models get a compressed context: the best few sentences of each passage.
+      const context = compact ? await compressHits(query, hits.slice(0, 5), fallbackEmbed) : hits;
+      await respond(ready, updateMsg, answerMessages(query, context, docMap, history, compact), () => extractive(query, hits, fallbackEmbed));
+    }
     setAnswering(false);
   }
 
@@ -428,6 +521,7 @@ export default function App({ autoSamples = false }: { autoSamples?: boolean }) 
             onSummarize={insights}
             chunking={chunking}
             onChunking={changeChunking}
+            onClear={clearWorkspace}
           />
         </aside>
 
@@ -461,7 +555,12 @@ export default function App({ autoSamples = false }: { autoSamples?: boolean }) 
                     <article key={m.id} className={`msg bot ${m.status}`}>
                       <span className="bot-mark" aria-hidden="true" />
                       <div className="bot-body">
-                        {m.quoted && <span className="quote-label">Quoted from your documents</span>}
+                        {(m.quoted || m.intent) && (
+                          <div className="msg-tags">
+                            {m.intent && <span className="intent-tag">{INTENT_LABEL[m.intent]}</span>}
+                            {m.quoted && <span className="quote-label">Quoted from your documents</span>}
+                          </div>
+                        )}
                         {m.status === 'working' && !m.text ? <Working phase={m.phase} started={m.started} /> : <Markdown text={m.text} onCite={openSource(m)} tips={tipsFor(m)} />}
                         {m.status !== 'working' && <Sources m={m} onOpen={openSource(m)} label={sourceLabel} docOf={(h) => docMap.get(h.chunk.docId)?.name ?? ''} />}
                         {m.meta && <small className="meta">{m.meta}</small>}
@@ -549,7 +648,7 @@ export default function App({ autoSamples = false }: { autoSamples?: boolean }) 
 
         {inspector && (
           <aside className="inspector">
-            <Pipeline stats={stats} />
+            <Pipeline stats={stats} evalRows={evalRows} canEvaluate={canEvaluate} onEvaluate={runEvaluation} />
           </aside>
         )}
       </div>

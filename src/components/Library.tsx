@@ -5,7 +5,7 @@ import type { Doc } from '../lib/types';
 const size = (b: number) => (b < 1024 * 1024 ? `${Math.max(1, Math.round(b / 1024))} KB` : `${(b / 1024 / 1024).toFixed(1)} MB`);
 
 export default function Library({
-  docs, chunkCount, busy, errors, onFiles, onSamples, onRemove, onSummarize, chunking, onChunking,
+  docs, chunkCount, busy, errors, onFiles, onSamples, onRemove, onSummarize, chunking, onChunking, onClear,
 }: {
   docs: Doc[];
   chunkCount: (id: string) => number;
@@ -17,6 +17,7 @@ export default function Library({
   onSummarize: (doc: Doc) => void;
   chunking: { size: number; overlap: number };
   onChunking: (c: { size: number; overlap: number }) => void;
+  onClear: () => void;
 }) {
   const input = useRef<HTMLInputElement>(null);
   const [over, setOver] = useState(false);
@@ -74,6 +75,11 @@ export default function Library({
           </label>
           <small className="muted">Changing these re-chunks and re-embeds every document; watch the pipeline update.</small>
         </details>
+      )}
+      {docs.length > 0 && (
+        <p className="saved-note">
+          Saved in this browser · <button className="link" onClick={onClear} disabled={busy}>Clear workspace</button>
+        </p>
       )}
     </section>
   );

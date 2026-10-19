@@ -76,7 +76,39 @@ export class Index {
     }
     const a = qvec ? alpha : 0; // keyword-only until embeddings are ready
     for (const r of rows) r.score = a * Math.max(0, r.vector) + (1 - a) * (maxK ? r.keyword / maxK : 0);
-    return rows.sort((x, y) => y.score - x.score).slice(0, k);
+    rows.sort((x, y) => y.score - x.score);
+    return qvec ? this.mmr(rows.slice(0, k * 4), k) : rows.slice(0, k);
+  }
+
+  /**
+   * Maximal Marginal Relevance: pick passages that are relevant AND not near-duplicates
+   * of ones already picked (overlapping chunks, repeated boilerplate), so the model sees
+   * more distinct evidence in the same budget.
+   */
+  private mmr(cands: Hit[], k: number, lambda = 0.75): Hit[] {
+    const vec = (h: Hit) => this.vectors[this.chunks.indexOf(h.chunk)];
+    const picked: Hit[] = [];
+    const pool = [...cands];
+    while (picked.length < k && pool.length) {
+      let best = 0;
+      let bestScore = -Infinity;
+      pool.forEach((c, i) => {
+        const v = vec(c);
+        let maxSim = 0;
+        if (v)
+          for (const p of picked) {
+            const pv = vec(p);
+            if (!pv) continue;
+            let dot = 0;
+            for (let d = 0; d < v.length; d++) dot += v[d] * pv[d];
+            maxSim = Math.max(maxSim, dot);
+          }
+        const s = lambda * c.score - (1 - lambda) * maxSim;
+        if (s > bestScore) [best, bestScore] = [i, s];
+      });
+      picked.push(pool.splice(best, 1)[0]);
+    }
+    return picked;
   }
 
   /** Evenly spaced chunks from one document, for summaries. */

@@ -81,3 +81,51 @@ export async function compressHits(question: string, hits: Hit[], embedFn?: Embe
     return { ...h, chunk: { ...h.chunk, text: keep.join(' ') || h.chunk.text } };
   });
 }
+
+/**
+ * Instant-mode overview without a model: names the document type from its title, then
+ * quotes the sentences most central to the document (closest to its average meaning),
+ * in reading order, so it reads as "what this document says", not keyword matches.
+ */
+export async function extractiveOverview(
+  chosen: { name: string; kind: string; title: string; hits: { hit: Hit; n: number }[] }[],
+  embedFn?: Embed,
+): Promise<string> {
+  const parts: string[] = [];
+  for (const c of chosen) {
+    const sents: { s: string; n: number; order: number }[] = [];
+    const seen = new Set<string>(); // overlapping chunks repeat sentences
+    c.hits.forEach(({ hit, n }, hi) => {
+      hit.chunk.text
+        .split(/(?<=[.!?])\s+|\n+/)
+        .map(clean)
+        .filter((s) => s.length >= 40 && s.length <= 320 && s !== c.title && !/^(owner|author|status|severity)\b/i.test(s))
+        .forEach((s, si) => {
+          if (seen.has(s)) return;
+          seen.add(s);
+          sents.push({ s, n, order: hi * 1000 + si });
+        });
+    });
+    let picked = sents.slice(0, 3);
+    if (embedFn && sents.length > 3) {
+      try {
+        const vs = await embedFn(sents.map((x) => x.s));
+        const centroid = new Float32Array(vs[0].length);
+        vs.forEach((v) => v.forEach((x, d) => (centroid[d] += x / vs.length)));
+        // Central to the document's meaning, with a nudge towards the scene-setting opening.
+        const score = vs.map((v, i) => v.reduce((acc, x, d) => acc + x * centroid[d], 0) + 0.08 * (1 - i / vs.length));
+        picked = sents
+          .map((x, i) => ({ ...x, score: score[i] }))
+          .sort((a, b) => b.score - a.score)
+          .slice(0, 3)
+          .sort((a, b) => a.order - b.order);
+      } catch {
+        /* keep the opening sentences */
+      }
+    }
+    const article = /^[aeiou]/i.test(c.kind) ? 'an' : 'a';
+    const intro = `**${c.name}** is ${article} ${c.kind}${c.title ? ` titled “${c.title}”` : ''}.`;
+    parts.push(`${intro} ${picked.map((p) => `${p.s} [${p.n}]`).join(' ')}`);
+  }
+  return parts.join('\n\n');
+}

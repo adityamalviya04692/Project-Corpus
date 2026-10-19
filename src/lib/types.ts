@@ -12,6 +12,8 @@ export interface Doc {
   pages: Page[];
   chars: number;
   parseMs: number;
+  /** SHA-256 of the file bytes, for de-duplication. */
+  hash?: string;
 }
 
 export interface Chunk {
@@ -36,7 +38,7 @@ export interface PipelineStats {
   chunk: { chunks: number; avgChars: number; size: number; overlap: number; ms: number };
   embed: { model: string; dims: number; ms: number; status: 'idle' | 'loading' | 'embedding' | 'ready' | 'error'; progress: number; note?: string };
   index: { vectors: number; bytes: number };
-  retrieve?: { query: string; ms: number; k: number; hits: { label: string; score: number; vector: number; keyword: number }[] };
+  retrieve?: { query: string; strategy?: string; ms: number; k: number; hits: { label: string; score: number; vector: number; keyword: number }[] };
   generate?: { provider: string; model: string; ms: number; chars: number };
 }
 

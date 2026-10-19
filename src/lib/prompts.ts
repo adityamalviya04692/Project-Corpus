@@ -5,6 +5,7 @@ import type { ChatMessage, Doc, Hit } from './types';
    turns those markers into clickable source chips. */
 
 const SYSTEM = `You are Corpus, a careful research assistant. Answer ONLY from the numbered passages provided.
+Lead with a direct answer in one or two plain sentences, then add supporting detail only if it helps.
 Cite every claim with the passage number in square brackets, like [2] or [1][3].
 If the passages do not contain the answer, say so plainly instead of guessing.
 When documents disagree, treat the newest version or date as current and say what changed.
@@ -24,7 +25,7 @@ export const context = (hits: Hit[], docs: Map<string, Doc>) =>
   hits.map((h, i) => `[${i + 1}] (${label(h, docs)})\n${h.chunk.text}`).join('\n\n');
 
 /** Small on-device models follow instructions placed right next to the question best. */
-const COMPACT_RULES = `Answer in at most 80 words, as 2–4 short bullet points. Stop when the question is answered.
+const COMPACT_RULES = `Start with ONE sentence that directly answers the question. Then add at most 3 short bullet points with supporting facts. At most 80 words. Stop when the question is answered.
 End every bullet with the number of the passage it comes from, like [2].
 Use only the passages. If they don't contain the answer, say "The documents don't say."
 If documents disagree, the newest version or date is the current one; mention older values only as "previously".`;
@@ -88,5 +89,23 @@ export function summaryMessages(doc: Doc, hits: Hit[], docs: Map<string, Doc>): 
       role: 'user',
       content: `Passages from "${doc.name}":\n\n${context(hits, docs)}\n\nGive insights about this document: a one-sentence summary, then 4–6 bullet points with the key facts, numbers, decisions or risks. Cite passages.`,
     },
+  ];
+}
+
+/**
+ * "What is this about?" answers. The passages are an even sample across each document,
+ * and the model is asked for a narrative (what the document is, its purpose, what it
+ * explains), not a list of topics.
+ */
+export function overviewMessages(chosen: { doc: Doc; kind: string }[], hits: Hit[], docs: Map<string, Doc>, question: string, compact = false): ChatMessage[] {
+  const many = chosen.length > 1;
+  const which = chosen.map((c) => `"${c.doc.name}" (looks like a ${c.kind})`).join(', ');
+  const shape = many
+    ? `For each document write a short paragraph: first say what it is and what it is for (e.g. "lakehouse-design-v2.md is a design document that describes…"), then explain its main content in plain language. Finish with one sentence on how the documents relate.`
+    : `Start with one sentence saying what this document is and what it is for (e.g. "This is a design document that describes…"). Then explain, in 3–5 plain sentences, what it covers: the key decisions, numbers and conclusions. Write prose, not a list of headings.`;
+  const rules = compact ? `${shape}\nAt most ${many ? 130 : 90} words. Cite passages like [2].` : `${shape}\nCite passages like [2]. Do not invent anything that is not in the passages.`;
+  return [
+    { role: 'system', content: compact ? 'You explain documents clearly, using numbered passages from them, and cite them.' : SYSTEM },
+    { role: 'user', content: `Documents: ${which}.\n\nPassages (an even sample from each document, in order):\n\n${context(hits, docs)}\n\nQuestion: ${question}\n\n${rules}` },
   ];
 }

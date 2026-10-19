@@ -1,5 +1,7 @@
-/* Promise wrapper around the embedding worker, with a per-text cache so a sentence or
-   passage is only ever embedded once (follow-up questions and re-ranking reuse it). */
+/* Promise wrapper around the embedding worker, with a two-level cache (memory, then
+   IndexedDB) so a sentence or passage is only ever embedded once, even across reloads. */
+
+import { textKey, vecGetMany, vecSetMany } from './store';
 
 export const EMBED_MODEL = 'all-MiniLM-L6-v2';
 export const EMBED_DIMS = 384;
@@ -40,10 +42,17 @@ function run(texts: string[], onProgress?: Progress): Promise<Float32Array[]> {
 }
 
 export async function embed(texts: string[], onProgress?: Progress): Promise<Float32Array[]> {
-  const missing = [...new Set(texts.filter((t) => !cache.has(t)))];
+  let missing = [...new Set(texts.filter((t) => !cache.has(t)))];
+  if (missing.length) {
+    // Second level: vectors persisted by earlier sessions.
+    const stored = await vecGetMany(missing.map(textKey));
+    missing.forEach((t, i) => stored[i] && cache.set(t, stored[i]!));
+    missing = missing.filter((t) => !cache.has(t));
+  }
   if (missing.length) {
     const vecs = await run(missing, onProgress);
     missing.forEach((t, i) => cache.set(t, vecs[i]));
+    void vecSetMany(missing.map((t, i) => [textKey(t), vecs[i]]));
   } else {
     onProgress?.('embed', 1);
   }

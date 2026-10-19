@@ -4,7 +4,7 @@ Ask questions across PDFs, Word, Markdown, CSV and HTML files, get **cited answe
 **insights per document**, and **compare documents side by side**. The whole retrieval
 pipeline runs in the browser and is shown live, stage by stage.
 
-**Live:** https://adityamalviya04692.github.io/Project-Corpus/
+**Live:** https://adityamalviya04692.github.io/Project-Corpus/ — landing page, then *Open app*.
 
 ## Why it's interesting
 
@@ -15,13 +15,19 @@ pipeline runs in the browser and is shown live, stage by stage.
   in a Web Worker) blended with BM25 for exact terms like table names and error codes.
 - **Exact citations.** Chunks never span pages, every answer cites `[n]`, and each citation
   opens the source passage.
-- **Runs without an API key.** Four ways to answer:
+- **Runs Google's Gemma 4 in the browser.** Gemma 4 E2B (2.8 GB, one-time download) runs on
+  WebGPU through WebLLM, with Qwen3 1.7B and Gemma 3 1B as lighter options. Small models get a
+  *compressed context* (the best few sentences of each passage, ranked by embeddings) and a
+  citation safety net, which makes their answers markedly more accurate.
+- **Four ways to answer, no key required:**
   | Mode | Needs | Notes |
   |---|---|---|
-  | Instant | nothing | Ranks and quotes the best sentences. Works offline, everywhere. |
-  | In-browser AI | WebGPU (Chrome/Edge desktop) | Qwen 2.5 / Llama 3.2 via WebLLM, downloaded once (~1 GB). |
-  | Your own key | a key | Gemini and Groq (free tiers), OpenRouter (free models), Anthropic, any OpenAI-compatible API. Stored only in your browser. |
-  | Hosted demo | owner's setup | Optional Cloudflare Worker holding the owner's free Gemini key (`worker/`). |
+  | Gemma in your browser | WebGPU (Chrome/Edge desktop) | Free, private, offline after download. |
+  | Google AI Studio | free key | `gemma-4-26b-a4b-it` on Google's free tier, or any Gemini model. |
+  | Instant | nothing | Ranks and quotes the best sentences. Works everywhere. |
+  | Hosted Gemma 4 | owner's setup | Optional Cloudflare Worker holding the owner's free key (`worker/`). |
+
+  Groq, OpenRouter, Anthropic and any OpenAI-compatible API work with your own key too.
 - **Private by default.** Documents never leave the device unless you pick a remote model,
   and then only the retrieved passages are sent.
 
@@ -42,6 +48,6 @@ Push to `main`: the GitHub Actions workflow tests, builds and publishes to GitHu
 
 ## Stack
 
-React 19 · TypeScript · Vite · Transformers.js · WebLLM · pdf.js · mammoth · marked + DOMPurify · Vitest · Cloudflare Workers (optional)
+React 19 · TypeScript · Vite · Gemma 4 · WebLLM · Transformers.js · pdf.js · mammoth · marked + DOMPurify · Vitest · Cloudflare Workers (optional)
 
 MIT © Aditya Malviya

@@ -2,13 +2,13 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import Library from './components/Library';
 import Markdown from './components/Markdown';
 import Pipeline from './components/Pipeline';
-import SettingsDialog from './components/Settings';
+import EngineDialog from './components/Settings';
 import { chunkDoc } from './lib/chunk';
 import { EMBED_DIMS, EMBED_MODEL, embed } from './lib/embedder';
-import { extractive, rankSentences } from './lib/instant';
+import { compressHits, extractive, rankSentences } from './lib/instant';
 import { parseFile } from './lib/parse';
-import { answerMessages, compareMessages, summaryMessages } from './lib/prompts';
-import { DEMO_URL, PROVIDERS, browserModelLoaded, generate, modelFor, type Settings } from './lib/providers';
+import { answerMessages, compareMessages, ensureCitations, summaryMessages } from './lib/prompts';
+import { BROWSER_MODELS, DEMO_URL, PROVIDERS, browserModelLoaded, generate, loadBrowserModel, modelFor, type ProviderId, type Settings } from './lib/providers';
 import { Index } from './lib/search';
 import type { ChatMessage, Chunk, Doc, Hit, PipelineStats } from './lib/types';
 
@@ -40,7 +40,7 @@ function loadSettings(): Settings {
 
 let msgId = 0;
 
-export default function App() {
+export default function App({ autoSamples = false }: { autoSamples?: boolean }) {
   const [docs, setDocs] = useState<Doc[]>([]);
   const [chunks, setChunks] = useState<Chunk[]>([]);
   const [chunking, setChunking] = useState({ size: 900, overlap: 150 });
@@ -49,6 +49,8 @@ export default function App() {
   const [errors, setErrors] = useState<string[]>([]);
   const [settings, setSettings] = useState<Settings>(loadSettings);
   const [showSettings, setShowSettings] = useState(false);
+  const [inspector, setInspector] = useState(() => window.innerWidth > 1180);
+  const [engineLoad, setEngineLoad] = useState<{ p: number; text: string; error?: string } | null>(null);
   const [tab, setTab] = useState<'ask' | 'compare'>('ask');
   const [messages, setMessages] = useState<Msg[]>([]);
   const [compareResult, setCompareResult] = useState<Msg | null>(null);
@@ -62,6 +64,7 @@ export default function App() {
   const docMap = useMemo(() => new Map(docs.map((d) => [d.id, d])), [docs]);
   const provider = PROVIDERS.find((p) => p.id === settings.provider) ?? PROVIDERS[0];
   const embedReady = stats.embed.status === 'ready';
+  const browserLabel = BROWSER_MODELS.find((m) => m.id === modelFor(settings, 'browser'))?.label ?? 'Gemma';
 
   useEffect(() => {
     try {
@@ -132,6 +135,32 @@ export default function App() {
     await rebuild(next);
   }
 
+  // "Try with samples" from the landing page loads them straight away.
+  const autoLoaded = useRef(false);
+  useEffect(() => {
+    if (autoSamples && !autoLoaded.current) {
+      autoLoaded.current = true;
+      void addSamples();
+    }
+  }, [autoSamples]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  /* One-time download of the in-browser model, with progress shown in the app bar. */
+  async function loadBrowser(id = modelFor(settings, 'browser')) {
+    setSettings((s) => ({ ...s, provider: 'browser', models: { ...s.models, browser: id } }));
+    setEngineLoad({ p: 0, text: 'Starting…' });
+    try {
+      await loadBrowserModel(id, (p, text) => setEngineLoad({ p, text }));
+      setEngineLoad(null);
+    } catch (e) {
+      setEngineLoad({ p: 0, text: '', error: e instanceof Error ? e.message : String(e) });
+    }
+  }
+
+  const openEngine = (provider?: ProviderId) => {
+    if (provider) setSettings((s) => ({ ...s, provider }));
+    setShowSettings(true);
+  };
+
   async function addSamples() {
     const base = import.meta.env.BASE_URL;
     const files = await Promise.all(
@@ -183,7 +212,7 @@ export default function App() {
       return;
     }
     if (settings.provider === 'browser' && !browserModelLoaded(modelFor(settings, 'browser'))) {
-      set({ ...slot, text: `${await fallback()}\n\n_The in-browser model isn't loaded yet. Open **Settings** to download it._`, status: 'done', meta: 'Instant · extractive' });
+      set({ ...slot, text: `${await fallback()}\n\n_${engineLoad && !engineLoad.error ? `Gemma is still downloading (${Math.round(engineLoad.p * 100)}%). These are quotes until it's ready.` : 'The in-browser model is not loaded yet — open the model menu to download it.'}_`, status: 'done', meta: 'Instant · extractive' });
       return;
     }
     const controller = new AbortController();
@@ -191,8 +220,8 @@ export default function App() {
     const t0 = performance.now();
     const model = modelFor(settings, settings.provider);
     try {
-      const text = await generate(settings, prompt, (t) => set({ ...slot, text: t, status: 'streaming' }), controller.signal);
-      set({ ...slot, text: text || '_No answer returned._', status: 'done', meta: `${provider.label} · ${model}` });
+      const text = ensureCitations(await generate(settings, prompt, (t) => set({ ...slot, text: t, status: 'streaming' }), controller.signal), slot.hits ?? []);
+      set({ ...slot, text: text || '_No answer returned._', status: 'done', meta: `${settings.provider === 'browser' ? browserLabel : provider.label} · ${model}` });
       setStats((s) => ({ ...s, generate: { provider: provider.label, model, ms: performance.now() - t0, chars: text.length } }));
     } catch (e) {
       if (controller.signal.aborted) {
@@ -223,7 +252,10 @@ export default function App() {
     const hits = await retrieve(query, 6);
     const ready = { ...slot, hits };
     updateMsg(ready);
-    await respond(ready, updateMsg, answerMessages(query, hits, docMap, history), () => extractive(query, hits, embedReady ? embed : undefined));
+    // On-device models get a compressed context: the best few sentences of each passage.
+    const compact = settings.provider === 'browser';
+    const context = compact ? await compressHits(query, hits.slice(0, 5), embedReady ? embed : undefined) : hits;
+    await respond(ready, updateMsg, answerMessages(query, context, docMap, history, compact), () => extractive(query, hits, embedReady ? embed : undefined));
     setAnswering(false);
   }
 
@@ -236,7 +268,9 @@ export default function App() {
     const slot: Msg = { id: ++msgId, role: 'assistant', text: '', status: 'working', hits };
     setMessages((list) => [...list, user, slot]);
     const fallback = () => hits.map((h, i) => `- ${h.chunk.text.split(/(?<=[.!?])\s+/)[0]} [${i + 1}]`).join('\n');
-    await respond(slot, updateMsg, summaryMessages(doc, hits, docMap), fallback);
+    const compact = settings.provider === 'browser';
+    const context = compact ? await compressHits('key facts, numbers, decisions and risks', hits, embedReady ? embed : undefined, 2) : hits;
+    await respond(slot, updateMsg, summaryMessages(doc, context, docMap), fallback);
     setAnswering(false);
   }
 
@@ -271,7 +305,8 @@ export default function App() {
       );
       return head + rows.join('\n');
     };
-    await respond(ready, setCompareResult, compareMessages(query, hits, docMap, chosen), fallback);
+    const context = settings.provider === 'browser' ? await compressHits(query, hits, embedReady ? embed : undefined, 3) : hits;
+    await respond(ready, setCompareResult, compareMessages(query, context, docMap, chosen), fallback);
     setAnswering(false);
   }
 
@@ -281,31 +316,72 @@ export default function App() {
   };
 
   const chunkCount = (id: string) => chunks.filter((c) => c.docId === id).length;
+  const browserReady = browserModelLoaded(modelFor(settings, 'browser'));
+  const engineName = settings.provider === 'browser' ? browserLabel : provider.label;
+  const engineState =
+    engineLoad && !engineLoad.error
+      ? `${Math.round(engineLoad.p * 100)}%`
+      : settings.provider === 'browser' && !browserReady
+        ? 'not loaded'
+        : provider.needsKey && !settings.keys[settings.provider]
+          ? 'add key'
+          : '';
+  const quotesOnly = settings.provider === 'instant' || (settings.provider === 'browser' && !browserReady);
   const suggestions = docs.some((d) => d.name.startsWith('lakehouse-design'))
     ? ['What changed between the v1 and v2 lakehouse designs?', 'How was the skewed join incident fixed?', 'What is the data freshness SLA now?']
     : ['Summarise what these documents are about', 'What are the key risks or open issues?', 'List every number or deadline mentioned'];
 
-  return (
-    <div className="app">
-      <header className="top">
-        <div className="brand">
-          <span className="logo" aria-hidden="true" />
-          <div>
-            <h1>Corpus</h1>
-            <p>Chat with your documents — cited answers, comparisons, a visible RAG pipeline.</p>
-          </div>
+
+  const sourceLabel = (h: Hit) => {
+    const d = docMap.get(h.chunk.docId);
+    return `${d?.name ?? ''}${(d?.pages.length ?? 1) > 1 ? ` · p.${h.chunk.page}` : ''}`;
+  };
+
+  const engineBanner = quotesOnly && (
+    <div className="engine-banner">
+      <div>
+        <strong>{engineLoad && !engineLoad.error ? `Downloading ${browserLabel}… ${Math.round(engineLoad.p * 100)}%` : 'Answers are quotes right now.'}</strong>
+        <span>
+          {engineLoad && !engineLoad.error
+            ? 'You can keep asking — answers switch to Gemma as soon as it is ready.'
+            : 'For written, cited answers run Gemma 4 free in your browser, or use a free Google AI Studio key.'}
+        </span>
+        {engineLoad && !engineLoad.error && <i className="banner-bar" style={{ width: `${engineLoad.p * 100}%` }} />}
+      </div>
+      {!(engineLoad && !engineLoad.error) && (
+        <div className="banner-actions">
+          <button className="btn small" onClick={() => void loadBrowser(BROWSER_MODELS[0].id)}>Run Gemma 4 · 2.8 GB</button>
+          <button className="btn small ghost" onClick={() => openEngine('gemini')}>Use a free key</button>
         </div>
-        <button className="provider-pill" onClick={() => setShowSettings(true)} aria-label="Change answer provider">
-          <i className={`dot ${settings.provider}`} />
-          {provider.label}
-          {settings.provider === 'browser' && !browserModelLoaded(modelFor(settings, 'browser')) && <em>not loaded</em>}
-          {provider.needsKey && !settings.keys[settings.provider] && <em>add key</em>}
-          <span aria-hidden="true">⚙</span>
-        </button>
+      )}
+    </div>
+  );
+
+  return (
+    <div className="shell">
+      <header className="appbar">
+        <a className="brand-sm" href="#/" aria-label="Corpus home">
+          <span className="logo" aria-hidden="true" />
+          Corpus
+        </a>
+        <span className="appbar-stat">
+          {docs.length ? `${docs.length} ${docs.length === 1 ? 'document' : 'documents'} · ${chunks.length} chunks` : 'No documents yet'}
+        </span>
+        <div className="appbar-right">
+          <button className="engine-chip" onClick={() => openEngine()} aria-label={`Model: ${engineName}. Change model`}>
+            <i className={`dot ${settings.provider}${engineLoad && !engineLoad.error ? ' loading' : ''}`} />
+            <span>{engineName}</span>
+            {engineState && <em>{engineState}</em>}
+            <span className="caret" aria-hidden="true">▾</span>
+          </button>
+          <button className={`icon-toggle${inspector ? ' on' : ''}`} onClick={() => setInspector((v) => !v)} aria-pressed={inspector} title="Pipeline inspector">
+            <span aria-hidden="true">⫶</span> Pipeline
+          </button>
+        </div>
       </header>
 
-      <div className="layout">
-        <aside>
+      <div className={`workspace${inspector ? ' with-inspector' : ''}`}>
+        <aside className="sidebar">
           <Library
             docs={docs}
             chunkCount={chunkCount}
@@ -318,61 +394,57 @@ export default function App() {
             chunking={chunking}
             onChunking={changeChunking}
           />
-          <Pipeline stats={stats} />
         </aside>
 
-        <main>
-          <nav className="tabs" role="tablist">
+        <main className="stage">
+          <div className="segmented" role="tablist">
             <button role="tab" aria-selected={tab === 'ask'} onClick={() => setTab('ask')}>Ask</button>
-            <button role="tab" aria-selected={tab === 'compare'} onClick={() => setTab('compare')} disabled={docs.length < 2} title={docs.length < 2 ? 'Add at least two documents' : ''}>
-              Compare
-            </button>
-          </nav>
+            <button role="tab" aria-selected={tab === 'compare'} onClick={() => setTab('compare')} disabled={docs.length < 2} title={docs.length < 2 ? 'Add at least two documents' : ''}>Compare</button>
+          </div>
 
           {tab === 'ask' ? (
             <section className="chat" aria-label="Ask your documents">
               <div className="thread" aria-live="polite">
-                {!messages.length && (
-                  <div className="empty">
-                    {docs.length ? (
-                      <>
-                        <h2>Ask anything across {docs.length === 1 ? 'your document' : `your ${docs.length} documents`}.</h2>
-                        <div className="chips">
-                          {suggestions.map((s) => (
-                            <button key={s} onClick={() => ask(s)} disabled={answering || !chunks.length}>{s}</button>
-                          ))}
-                        </div>
-                      </>
-                    ) : (
-                      <>
-                        <h2>Drop in a few documents to start.</h2>
-                        <p>Everything is parsed, chunked and embedded in your browser. Ask questions across all of them, compare them, or get insights per file. No sign-up, no key needed.</p>
-                        <button className="btn" onClick={addSamples} disabled={busy}>Load sample documents</button>
-                      </>
-                    )}
-                  </div>
-                )}
+                {!messages.length &&
+                  (docs.length ? (
+                    <div className="welcome">
+                      <h2>What would you like to know?</h2>
+                      <p>Ask across {docs.length === 1 ? 'your document' : `all ${docs.length} documents`}. Every answer cites its sources.</p>
+                      <div className="chips">
+                        {suggestions.map((s) => (
+                          <button key={s} onClick={() => ask(s)} disabled={answering || !chunks.length}>{s}</button>
+                        ))}
+                      </div>
+                    </div>
+                  ) : (
+                    <EmptyDrop busy={busy} onFiles={addFiles} onSamples={addSamples} />
+                  ))}
                 {messages.map((m) =>
                   m.role === 'user' ? (
                     <div key={m.id} className="msg user">{m.text}</div>
                   ) : (
                     <article key={m.id} className={`msg bot ${m.status}`}>
-                      {m.status === 'working' && !m.text ? <span className="typing">Searching your documents…</span> : <Markdown text={m.text} onCite={openSource(m)} />}
-                      {m.hits && m.hits.length > 0 && m.status !== 'working' && (
-                        <div className="sources">
-                          {m.hits.map((h, i) => (
-                            <button key={h.chunk.id + i} onClick={() => setSource({ n: i + 1, hit: h })} title={h.chunk.text.slice(0, 200)}>
-                              <b>{i + 1}</b> {docMap.get(h.chunk.docId)?.name}
-                              {(docMap.get(h.chunk.docId)?.pages.length ?? 1) > 1 ? ` · p.${h.chunk.page}` : ''}
-                            </button>
-                          ))}
-                        </div>
-                      )}
-                      {m.meta && <small className="meta">{m.meta}</small>}
+                      <span className="bot-mark" aria-hidden="true" />
+                      <div className="bot-body">
+                        {m.status === 'working' && !m.text ? <span className="typing">Searching your documents</span> : <Markdown text={m.text} onCite={openSource(m)} />}
+                        {m.hits && m.hits.length > 0 && m.status !== 'working' && (
+                          <div className="source-cards">
+                            {m.hits.map((h, i) => (
+                              <button key={h.chunk.id + i} onClick={() => setSource({ n: i + 1, hit: h })}>
+                                <span className="src-n">{i + 1}</span>
+                                <span className="src-name">{sourceLabel(h)}</span>
+                                <span className="src-snip">{h.chunk.text.replace(/[#*]/g, '').slice(0, 110)}…</span>
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                        {m.meta && <small className="meta">{m.meta}</small>}
+                      </div>
                     </article>
                   ),
                 )}
               </div>
+              {docs.length > 0 && engineBanner}
               <form
                 className="composer"
                 onSubmit={(e) => {
@@ -389,21 +461,24 @@ export default function App() {
                       void ask(question);
                     }
                   }}
-                  placeholder={chunks.length ? 'Ask a question about your documents…' : 'Add documents first'}
+                  placeholder={chunks.length ? 'Ask a question about your documents…' : 'Add documents to start asking'}
                   disabled={!chunks.length}
-                  rows={2}
+                  rows={1}
                   aria-label="Question"
                 />
                 {answering ? (
-                  <button type="button" className="btn ghost" onClick={() => abort.current?.abort()}>Stop</button>
+                  <button type="button" className="send stop" onClick={() => abort.current?.abort()} aria-label="Stop">■</button>
                 ) : (
-                  <button className="btn" disabled={!question.trim() || !chunks.length}>Ask</button>
+                  <button className="send" disabled={!question.trim() || !chunks.length} aria-label="Ask">↑</button>
                 )}
               </form>
             </section>
           ) : (
             <section className="compare" aria-label="Compare documents">
-              <p className="muted">Pick two or more documents and what to compare. Corpus retrieves the most relevant passages from each and lines them up.</p>
+              <div className="compare-head">
+                <h2>Compare documents</h2>
+                <p>Choose two or more and what to compare. Corpus retrieves the strongest passages from each and lines them up.</p>
+              </div>
               <div className="picks">
                 {docs.map((d) => (
                   <label key={d.id} className={picked.has(d.id) ? 'on' : ''}>
@@ -422,36 +497,46 @@ export default function App() {
                 ))}
               </div>
               <form
-                className="composer"
+                className="composer inline"
                 onSubmit={(e) => {
                   e.preventDefault();
                   void compare();
                 }}
               >
-                <input value={aspect} onChange={(e) => setAspect(e.target.value)} placeholder="Compare on… e.g. architecture, costs, SLAs (optional)" aria-label="Comparison focus" />
+                <input value={aspect} onChange={(e) => setAspect(e.target.value)} placeholder="Compare on… architecture, costs, SLAs (optional)" aria-label="Comparison focus" />
                 <button className="btn" disabled={picked.size < 2 || answering}>Compare</button>
               </form>
+              {engineBanner}
               {compareResult && (
                 <article className={`msg bot wide ${compareResult.status}`}>
-                  {compareResult.status === 'working' && !compareResult.text ? <span className="typing">Reading each document…</span> : <Markdown text={compareResult.text} onCite={openSource(compareResult)} />}
-                  {compareResult.meta && <small className="meta">{compareResult.meta}</small>}
+                  <span className="bot-mark" aria-hidden="true" />
+                  <div className="bot-body">
+                    {compareResult.status === 'working' && !compareResult.text ? <span className="typing">Reading each document</span> : <Markdown text={compareResult.text} onCite={openSource(compareResult)} />}
+                    {compareResult.meta && <small className="meta">{compareResult.meta}</small>}
+                  </div>
                 </article>
               )}
             </section>
           )}
         </main>
+
+        {inspector && (
+          <aside className="inspector">
+            <Pipeline stats={stats} />
+          </aside>
+        )}
       </div>
 
       {source && (
         <div className="drawer-backdrop" onClick={() => setSource(null)}>
           <aside className="drawer" onClick={(e) => e.stopPropagation()} aria-label="Source passage">
             <header>
-              <span className="badge">[{source.n}]</span>
+              <span className="src-n big">{source.n}</span>
               <div>
                 <strong>{docMap.get(source.hit.chunk.docId)?.name}</strong>
                 <small>
                   chunk #{source.hit.chunk.index + 1}
-                  {(docMap.get(source.hit.chunk.docId)?.pages.length ?? 1) > 1 ? ` · page ${source.hit.chunk.page}` : ''} · score {source.hit.score.toFixed(2)}
+                  {(docMap.get(source.hit.chunk.docId)?.pages.length ?? 1) > 1 ? ` · page ${source.hit.chunk.page}` : ''} · relevance {source.hit.score.toFixed(2)}
                 </small>
               </div>
               <button className="icon-btn" onClick={() => setSource(null)} aria-label="Close source">✕</button>
@@ -463,12 +548,45 @@ export default function App() {
         </div>
       )}
 
-      <SettingsDialog open={showSettings} settings={settings} onChange={setSettings} onClose={() => setShowSettings(false)} />
+      <EngineDialog
+        open={showSettings}
+        settings={settings}
+        onChange={setSettings}
+        onClose={() => setShowSettings(false)}
+        load={engineLoad}
+        onLoadBrowser={loadBrowser}
+      />
+    </div>
+  );
+}
 
-      <footer className="foot">
-        Runs in your browser — documents never leave your device unless you choose an API provider.
-        <a href="https://adityamalviya04692.github.io/Portfolio/" target="_blank" rel="noreferrer">Built by Aditya Malviya ↗</a>
-      </footer>
+/* First-run state: one big, friendly drop target. */
+function EmptyDrop({ busy, onFiles, onSamples }: { busy: boolean; onFiles: (f: File[]) => void; onSamples: () => void }) {
+  const [over, setOver] = useState(false);
+  return (
+    <div
+      className={`empty-drop${over ? ' over' : ''}`}
+      onDragOver={(e) => {
+        e.preventDefault();
+        setOver(true);
+      }}
+      onDragLeave={() => setOver(false)}
+      onDrop={(e) => {
+        e.preventDefault();
+        setOver(false);
+        onFiles([...e.dataTransfer.files]);
+      }}
+    >
+      <span className="drop-icon" aria-hidden="true">⇪</span>
+      <h2>Drop your documents here</h2>
+      <p>PDF, Word, Markdown, CSV, HTML or text. Everything is processed on your device.</p>
+      <div className="hero-cta">
+        <label className="btn">
+          Choose files
+          <input type="file" multiple hidden accept=".pdf,.docx,.txt,.md,.markdown,.csv,.tsv,.html,.htm,.json,.log" onChange={(e) => onFiles([...(e.target.files ?? [])])} />
+        </label>
+        <button className="btn ghost" onClick={onSamples} disabled={busy}>Try 3 sample documents</button>
+      </div>
     </div>
   );
 }

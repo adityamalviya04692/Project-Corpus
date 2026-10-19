@@ -1,7 +1,7 @@
 /**
  * Corpus hosted-demo proxy (Cloudflare Worker, free plan).
  *
- * Holds YOUR Gemini API key as a secret so visitors can try Corpus with a strong model
+ * Holds YOUR Google AI Studio key as a secret so visitors can try Corpus with Gemma 4
  * without a key of their own. It only accepts requests from your site, caps the size
  * of each request and answer, and rate-limits each visitor.
  *
@@ -11,7 +11,7 @@
 export interface Env {
   GEMINI_API_KEY: string; // wrangler secret put GEMINI_API_KEY
   ALLOWED_ORIGIN: string; // e.g. https://adityamalviya04692.github.io
-  MODEL?: string; //         default gemini-2.5-flash
+  MODEL?: string; //         default gemma-4-26b-a4b-it (free tier)
 }
 
 const LIMIT = 20; // requests per visitor per hour (per Worker instance)
@@ -44,13 +44,13 @@ export default {
 
     const body = await req.text();
     if (body.length > 60_000) return new Response('Request too large', { status: 413, headers: cors(origin) });
-    const { messages } = JSON.parse(body) as { messages: { role: string; content: string }[] };
 
-    // Gemini's OpenAI-compatible endpoint keeps the client simple (same streaming format).
-    const upstream = await fetch('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', {
+    // The client sends a native Gemini/Gemma request body; we add the key and stream back.
+    const model = env.MODEL || 'gemma-4-26b-a4b-it';
+    const upstream = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${env.GEMINI_API_KEY}` },
-      body: JSON.stringify({ model: env.MODEL || 'gemini-2.5-flash', messages, stream: true, temperature: 0.2, max_tokens: 1200 }),
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': env.GEMINI_API_KEY },
+      body,
     });
     return new Response(upstream.body, {
       status: upstream.status,

@@ -1,11 +1,20 @@
-import { useEffect, useRef, useState } from 'react';
-import { BROWSER_MODELS, PROVIDERS, browserModelLoaded, hasWebGPU, loadBrowserModel, modelFor, type ProviderId, type Settings as S } from '../lib/providers';
+import { useEffect, useRef } from 'react';
+import { BROWSER_MODELS, PROVIDERS, browserModelLoaded, hasWebGPU, modelFor, type ProviderId, type Settings as S } from '../lib/providers';
 
-/* Choose where answers come from. Keys are kept in this browser only (localStorage). */
-export default function Settings({ open, settings, onChange, onClose }: { open: boolean; settings: S; onChange: (s: S) => void; onClose: () => void }) {
+type Load = { p: number; text: string; error?: string } | null;
+
+/* The model picker. Keys are kept in this browser only (localStorage). */
+export default function EngineDialog({
+  open, settings, onChange, onClose, load, onLoadBrowser,
+}: {
+  open: boolean;
+  settings: S;
+  onChange: (s: S) => void;
+  onClose: () => void;
+  load: Load;
+  onLoadBrowser: (id: string) => void;
+}) {
   const ref = useRef<HTMLDialogElement>(null);
-  const [load, setLoad] = useState<{ p: number; text: string; error?: string } | null>(null);
-  const [, force] = useState(0);
   const gpu = hasWebGPU();
 
   useEffect(() => {
@@ -18,67 +27,76 @@ export default function Settings({ open, settings, onChange, onClose }: { open: 
   const set = (patch: Partial<S>) => onChange({ ...settings, ...patch });
   const pick = (provider: ProviderId) => set({ provider });
   const browserModel = modelFor(settings, 'browser');
-
-  const startLoad = async () => {
-    setLoad({ p: 0, text: 'Starting…' });
-    try {
-      await loadBrowserModel(browserModel, (p, text) => setLoad({ p, text }));
-      setLoad(null);
-      pick('browser');
-      force((n) => n + 1);
-    } catch (e) {
-      setLoad({ p: 0, text: '', error: e instanceof Error ? e.message : String(e) });
-    }
-  };
+  const loading = load && !load.error;
 
   return (
-    <dialog ref={ref} className="settings" onClose={onClose} onCancel={onClose} aria-labelledby="settings-title">
+    <dialog ref={ref} className="engine-dialog" onClose={onClose} onCancel={onClose} aria-labelledby="engine-title">
       <header>
-        <h2 id="settings-title">Where answers come from</h2>
-        <button className="icon-btn" onClick={onClose} aria-label="Close settings">✕</button>
+        <div>
+          <h2 id="engine-title">Choose a model</h2>
+          <p>Search always runs on your device. Only the model you pick sees the matching passages.</p>
+        </div>
+        <button className="icon-btn" onClick={onClose} aria-label="Close">✕</button>
       </header>
-      <p className="muted">Search always runs in your browser. Only the model you pick below sees the matching passages. Keys stay in this browser.</p>
-      <div className="providers" role="radiogroup" aria-label="Answer provider">
+
+      <div className="engine-list" role="radiogroup" aria-label="Model">
         {PROVIDERS.map((p) => {
           const active = settings.provider === p.id;
           return (
-            <div key={p.id} className={`provider${active ? ' active' : ''}`}>
+            <div key={p.id} className={`engine-opt${active ? ' active' : ''}${p.id === 'browser' ? ' recommended' : ''}`}>
               <label>
                 <input type="radio" name="provider" checked={active} onChange={() => pick(p.id)} />
-                <span>
-                  <strong>{p.label}</strong>
+                <span className="opt-text">
+                  <strong>
+                    {p.label}
+                    {p.id === 'browser' && <em className="pill">Free · private</em>}
+                    {p.id === 'gemini' && <em className="pill alt">Free tier</em>}
+                  </strong>
                   <small>{p.blurb}</small>
                 </span>
               </label>
+
               {active && p.id === 'browser' && (
-                <div className="provider-body">
-                  {!gpu && <p className="warn">This browser has no WebGPU. Try Chrome or Edge on desktop, or use a key / Instant mode.</p>}
-                  <select value={browserModel} onChange={(e) => set({ models: { ...settings.models, browser: e.target.value } })} aria-label="In-browser model">
+                <div className="opt-body">
+                  {!gpu && <p className="warn">This browser has no WebGPU. Use Chrome or Edge on a desktop, or pick Google AI Studio / Instant.</p>}
+                  <div className="model-grid">
                     {BROWSER_MODELS.map((m) => (
-                      <option key={m.id} value={m.id}>{m.label} — {m.size}</option>
+                      <button
+                        key={m.id}
+                        className={`model-card${browserModel === m.id ? ' on' : ''}`}
+                        onClick={() => set({ models: { ...settings.models, browser: m.id } })}
+                        disabled={!!loading}
+                      >
+                        <b>{m.label}</b>
+                        <span>{m.size}</span>
+                        <small>{m.note}</small>
+                      </button>
                     ))}
-                  </select>
+                  </div>
                   {browserModelLoaded(browserModel) ? (
-                    <p className="ok">Model loaded and ready.</p>
-                  ) : load && !load.error ? (
+                    <p className="ok">✓ Loaded and ready. Runs fully offline.</p>
+                  ) : loading ? (
                     <div className="loadbar" role="progressbar" aria-valuenow={Math.round(load.p * 100)} aria-valuemin={0} aria-valuemax={100}>
                       <i style={{ width: `${load.p * 100}%` }} />
-                      <span>{load.text.slice(0, 80)}</span>
+                      <span>{Math.round(load.p * 100)}% · {load.text.replace(/\[.*?\]\s*/, '').slice(0, 70)}</span>
                     </div>
                   ) : (
-                    <button className="btn" disabled={!gpu} onClick={startLoad}>Download &amp; load model</button>
+                    <button className="btn" disabled={!gpu} onClick={() => onLoadBrowser(browserModel)}>
+                      Download &amp; run {BROWSER_MODELS.find((m) => m.id === browserModel)?.label}
+                    </button>
                   )}
                   {load?.error && <p className="warn">{load.error}</p>}
-                  <small className="muted">Downloaded once, then cached by your browser. Runs fully offline afterwards.</small>
+                  <small className="muted">Downloaded once from Hugging Face, then cached by your browser. You can close this and keep working while it loads.</small>
                 </div>
               )}
+
               {active && p.needsKey && (
-                <div className="provider-body">
+                <div className="opt-body">
                   <input
                     type="password"
                     autoComplete="off"
                     spellCheck={false}
-                    placeholder={`${p.label} API key`}
+                    placeholder={`Paste your ${p.label} API key`}
                     value={settings.keys[p.id] ?? ''}
                     onChange={(e) => set({ keys: { ...settings.keys, [p.id]: e.target.value } })}
                     aria-label={`${p.label} API key`}
@@ -92,12 +110,11 @@ export default function Settings({ open, settings, onChange, onClose }: { open: 
                   {p.id === 'openai' && (
                     <input placeholder="Base URL, e.g. https://api.openai.com/v1" value={settings.baseUrl} onChange={(e) => set({ baseUrl: e.target.value })} aria-label="Base URL" />
                   )}
-                  {p.keyUrl && (
-                    <a href={p.keyUrl} target="_blank" rel="noreferrer">Get a {p.label} key ↗</a>
-                  )}
-                  {settings.keys[p.id] && (
-                    <button className="link" onClick={() => set({ keys: { ...settings.keys, [p.id]: '' } })}>Forget this key</button>
-                  )}
+                  <div className="opt-links">
+                    {p.keyUrl && <a href={p.keyUrl} target="_blank" rel="noreferrer">Get a free key ↗</a>}
+                    {settings.keys[p.id] && <button className="link" onClick={() => set({ keys: { ...settings.keys, [p.id]: '' } })}>Forget key</button>}
+                  </div>
+                  <small className="muted">Stored only in this browser. Requests go straight from your browser to {p.label}.</small>
                 </div>
               )}
             </div>

@@ -26,3 +26,17 @@ describe('Index', () => {
     expect(tokenize('fixed skewed joins')).toEqual(['fix', 'skew', 'join']);
   });
 });
+
+import { ensureCitations } from './prompts';
+describe('ensureCitations', () => {
+  const hits = [
+    { chunk: c(0, 'Delta Lake MERGE handles SCD Type 2 updates for dimension tables'), score: 1, vector: 0, keyword: 0 },
+    { chunk: c(1, 'Kafka streams events into bronze tables every few seconds'), score: 1, vector: 0, keyword: 0 },
+  ];
+  it('adds the best-matching passage to uncited bullets', () => {
+    expect(ensureCitations('- Kafka streams events into bronze tables', hits)).toBe('- Kafka streams events into bronze tables [2]');
+  });
+  it('leaves answers that already cite alone', () => {
+    expect(ensureCitations('- Uses MERGE [1]', hits)).toBe('- Uses MERGE [1]');
+  });
+});

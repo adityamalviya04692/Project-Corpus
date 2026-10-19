@@ -141,9 +141,15 @@ export const hasWebGPU = () => typeof navigator !== 'undefined' && 'gpu' in navi
 
 export function loadBrowserModel(id: string, onProgress: (fraction: number, text: string) => void): Promise<Engine> {
   if (engine?.id === id) return engine.ready;
-  const ready = import('@mlc-ai/web-llm').then(({ CreateMLCEngine }) =>
-    CreateMLCEngine(id, { initProgressCallback: (r) => onProgress(r.progress, r.text) }),
-  );
+  const ready = import('@mlc-ai/web-llm').then(async ({ CreateMLCEngine }) => {
+    const e = await CreateMLCEngine(id, { initProgressCallback: (r) => onProgress(Math.min(r.progress, 0.98), r.text) });
+    // Warm-up: one tiny generation compiles the GPU kernels now, so the first real
+    // question doesn't pay that cost.
+    onProgress(0.99, 'Warming up the model…');
+    await e.chat.completions.create({ messages: [{ role: 'user', content: 'Hi' }], max_tokens: 1 });
+    await e.resetChat();
+    return e;
+  });
   const entry = { id, ready, loaded: false };
   engine = entry;
   ready.then(
@@ -164,7 +170,7 @@ async function browser(id: string, messages: ChatMessage[], onToken: OnToken, si
     messages,
     stream: true,
     temperature: 0.2,
-    max_tokens: 420,
+    max_tokens: 220,
     // Qwen3 thinks by default, so switch it off; RAG needs facts, not long reasoning.
     // (WebLLM implements this with Qwen's empty <think> block, which confuses Gemma 4;
     // Gemma 4 only thinks when its system prompt asks, so it needs nothing.)

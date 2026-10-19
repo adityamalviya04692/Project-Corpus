@@ -44,7 +44,7 @@ export async function extractive(question: string, hits: Hit[], embedFn?: Embed,
   if (!hits.length) return 'No matching passages in your documents.';
   const best = await rankSentences(question, hits, embedFn, maxSentences);
   if (!best.length) return `The closest passage is [1]:\n\n> ${hits[0].chunk.text.slice(0, 400)}…`;
-  return best.map((b) => `- ${b.s} [${b.n}]`).join('\n') + '\n\n_Instant mode quotes your documents directly. Load the in-browser AI or add a key for written answers._';
+  return best.map((b) => `- ${b.s} [${b.n}]`).join('\n');
 }
 
 /**

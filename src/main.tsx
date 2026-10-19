@@ -1,6 +1,7 @@
-import { StrictMode, useEffect, useState } from 'react';
+import { StrictMode, Suspense, lazy, useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import App from './App';
+// The workspace (parsers, search, model code) loads only when it is opened.
+const App = lazy(() => import('./App'));
 import Landing from './Landing';
 import './styles.css';
 
@@ -15,7 +16,13 @@ function Root() {
     addEventListener('hashchange', onHash);
     return () => removeEventListener('hashchange', onHash);
   }, []);
-  return hash.startsWith('#/app') ? <App autoSamples={hash.includes('samples')} /> : <Landing />;
+  return hash.startsWith('#/app') ? (
+    <Suspense fallback={<div className="boot">Opening Corpus…</div>}>
+      <App autoSamples={hash.includes('samples')} />
+    </Suspense>
+  ) : (
+    <Landing />
+  );
 }
 
 createRoot(document.getElementById('root')!).render(

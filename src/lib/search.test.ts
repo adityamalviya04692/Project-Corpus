@@ -40,3 +40,15 @@ describe('ensureCitations', () => {
     expect(ensureCitations('- Uses MERGE [1]', hits)).toBe('- Uses MERGE [1]');
   });
 });
+
+import { citationOccurrences, supportFor } from './support';
+describe('citation support', () => {
+  const hit = { chunk: c(0, 'The platform processes about 27 GB per day. The freshness SLA for gold tables is 15 minutes.'), score: 1, vector: 0, keyword: 0 };
+  it('picks the sentence that backs each line, not one per number', () => {
+    const answer = '- The freshness SLA is 15 minutes [1]\n- It processes 27 GB per day [1]';
+    const occ = citationOccurrences(answer);
+    expect(occ).toHaveLength(2);
+    expect(supportFor(occ[0].line, 1, hit)).toContain('15 minutes');
+    expect(supportFor(occ[1].line, 1, hit)).toContain('27 GB');
+  });
+});

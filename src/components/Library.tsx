@@ -54,8 +54,10 @@ export default function Library({
               <strong title={d.name}>{d.name}</strong>
               <small>{size(d.bytes)} · {d.pages.length} {d.pages.length === 1 ? 'page' : 'pages'} · {chunkCount(d.id)} chunks</small>
             </div>
-            <button className="mini" onClick={() => onSummarize(d)} disabled={busy} title="Key insights for this document">Insights</button>
-            <button className="icon-btn" onClick={() => onRemove(d.id)} aria-label={`Remove ${d.name}`} disabled={busy}>✕</button>
+            <span className="doc-actions">
+              <button className="icon-btn" onClick={() => onSummarize(d)} disabled={busy} title="Key insights" aria-label={`Key insights for ${d.name}`}>✦</button>
+              <button className="icon-btn" onClick={() => onRemove(d.id)} disabled={busy} title="Remove" aria-label={`Remove ${d.name}`}>✕</button>
+            </span>
           </li>
         ))}
       </ul>

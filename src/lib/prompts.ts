@@ -24,7 +24,7 @@ export const context = (hits: Hit[], docs: Map<string, Doc>) =>
   hits.map((h, i) => `[${i + 1}] (${label(h, docs)})\n${h.chunk.text}`).join('\n\n');
 
 /** Small on-device models follow instructions placed right next to the question best. */
-const COMPACT_RULES = `Answer in at most 120 words, as 2–5 short bullet points.
+const COMPACT_RULES = `Answer in at most 80 words, as 2–4 short bullet points. Stop when the question is answered.
 End every bullet with the number of the passage it comes from, like [2].
 Use only the passages. If they don't contain the answer, say "The documents don't say."
 If documents disagree, the newest version or date is the current one; mention older values only as "previously".`;

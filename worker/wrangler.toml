@@ -1,0 +1,7 @@
+name = "corpus-proxy"
+main = "src/index.ts"
+compatibility_date = "2026-09-01"
+
+[vars]
+ALLOWED_ORIGIN = "https://adityamalviya04692.github.io"
+# MODEL = "gemini-2.5-flash"

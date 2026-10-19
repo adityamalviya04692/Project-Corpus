@@ -1,0 +1,35 @@
+{
+  "name": "corpus",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Chat with your documents in the browser: cited answers, cross-document comparison and a visible RAG pipeline. Runs without an API key.",
+  "author": "Aditya Malviya",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^4.3.1",
+    "@mlc-ai/web-llm": "^0.2.86",
+    "dompurify": "^3.4.17",
+    "mammoth": "^1.13.0",
+    "marked": "^18.1.1",
+    "pdfjs-dist": "^6.4.299",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.2",
+    "@webgpu/types": "^0.1.74",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.4",
+    "vitest": "^5.0.5"
+  }
+}
